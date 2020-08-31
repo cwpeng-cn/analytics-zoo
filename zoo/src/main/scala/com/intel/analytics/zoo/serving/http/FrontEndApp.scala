@@ -30,12 +30,14 @@ import akka.stream.ActorMaterializer
 import akka.util.Timeout
 import com.codahale.metrics.MetricRegistry
 import com.google.common.util.concurrent.RateLimiter
+import com.intel.analytics.zoo.pipeline.inference.EncryptSupportive
+import com.intel.analytics.zoo.serving.utils.Conventions
 import org.slf4j.LoggerFactory
 
 import scala.concurrent.Await
 import scala.concurrent.duration.DurationInt
 
-object FrontEndApp extends Supportive {
+object FrontEndApp extends Supportive with EncryptSupportive {
   override val logger = LoggerFactory.getLogger(getClass)
 
   val name = "analytics zoo web serving frontend"
@@ -135,6 +137,29 @@ object FrontEndApp extends Supportive {
             }).toList
             complete(jacksonJsonSerializer.serialize(servingMetrics))
           }
+        } ~ (post & path("model-secure") &
+          extract(_.request.entity.contentType) & entity(as[String])) {
+          (contentType, content) => {
+            try {
+              val secrets = content.split("&")
+              val secret = secrets(0).split("=")(1)
+              val salt = secrets(1).split("=")(1)
+              val message = SecuredModelSecretSaltMessage(secret, salt)
+              val result = Await.result(redisPutter ? message, timeout.duration)
+                .asInstanceOf[Boolean]
+              result match {
+                case true => complete("model secured secrect and salt succeed to put in redis")
+                case false => complete("model secured secrect and salt failed to put in redis")
+              }
+            } catch {
+              case e: Exception =>
+                e.printStackTrace()
+                val error = ServingError(e.getMessage + "\n please post a content like " +
+                  "secret=xxx&salt=xxxx")
+                complete(500, error.toString)
+            }
+
+          }
         } ~ (post & path("predict") & extract(_.request.entity.contentType) & entity(as[String])) {
           (contentType, content) => {
             val rejected = arguments.tokenBucketEnabled match {
@@ -206,7 +231,7 @@ object FrontEndApp extends Supportive {
       }
       Http().bindAndHandle(route, arguments.interface, arguments.port)
       logger.info(s"http started at http://${arguments.interface}:${arguments.port}")
-      system.scheduler.schedule(10 milliseconds, 10 milliseconds,
+      system.scheduler.schedule(10 milliseconds, 1 milliseconds,
         redisPutter, PredictionInputFlushMessage())(system.dispatcher)
     }
   }
@@ -314,7 +339,7 @@ case class FrontEndAppArguments(
     securePort: Int = 10023,
     redisHost: String = "localhost",
     redisPort: Int = 6379,
-    redisInputQueue: String = "serving_stream",
+    redisInputQueue: String = Conventions.SERVING_STREAM_NAME,
     redisOutputQueue: String = "result:",
     parallelism: Int = 1000,
     timeWindow: Int = 0,
