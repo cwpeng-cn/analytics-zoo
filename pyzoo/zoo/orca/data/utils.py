@@ -192,6 +192,20 @@ def ray_partition_get_data_label(partition_data, allow_tuple=True, allow_list=Tr
     return data, label
 
 
+# todo: this might be very slow
+def to_sample(data):
+    from bigdl.util.common import Sample
+    data = check_type_and_convert(data, allow_list=True, allow_tuple=False)
+    features = data["x"]
+    labels = data["y"]
+    length = features[0].shape[0]
+
+    for i in range(length):
+        fs = [feat[i] for feat in features]
+        ls = [l[i] for l in labels]
+        yield Sample.from_ndarray(np.array(fs), np.array(ls))
+
+
 def read_pd_hdfs_file_list(iterator, file_type, **kwargs):
     import pyarrow as pa
     fs = pa.hdfs.connect()
@@ -235,33 +249,6 @@ def get_class_name(obj):
     if obj.__class__.__module__ != 'builtins':
         return '.'.join([obj.__class__.__module__, obj.__class__.__name__])
     return obj.__class__.__name__
-
-
-def get_node_ip():
-    """
-    This function is ported from ray to get the ip of the current node. In the settings where
-    Ray is not involved, calling ray.services.get_node_ip_address would introduce Ray overhead.
-    """
-    import socket
-    import errno
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # This command will raise an exception if there is no internet connection.
-        s.connect(("8.8.8.8", 80))
-        node_ip_address = s.getsockname()[0]
-    except OSError as e:
-        node_ip_address = "127.0.0.1"
-        # [Errno 101] Network is unreachable
-        if e.errno == errno.ENETUNREACH:
-            try:
-                # try get node ip address from host name
-                host_name = socket.getfqdn(socket.gethostname())
-                node_ip_address = socket.gethostbyname(host_name)
-            except Exception:
-                pass
-    finally:
-        s.close()
-    return node_ip_address
 
 
 def _convert_list_tuple(data, allow_tuple, allow_list):

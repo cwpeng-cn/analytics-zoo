@@ -43,7 +43,7 @@ class JVMGuard:
                         pids)
         except Exception as err:
             print(traceback.format_exc())
-            print("Cannot sucessfully register pid into JVMGuard")
+            print("Cannot successfully register pid into JVMGuard")
             for pid in pids:
                 os.kill(pid, signal.SIGKILL)
             raise err
@@ -55,9 +55,19 @@ class RayServiceFuncGenerator(object):
     """
     def _prepare_env(self):
         modified_env = os.environ.copy()
-        cwd = os.getcwd()
-        modified_env["PATH"] = "{}/{}:{}".format(cwd, "/".join(self.python_loc.split("/")[:-1]),
-                                                 os.environ["PATH"])
+        if self.python_loc == "python_env/bin/python":
+            # In this case the executor is using the conda yarn archive under the current
+            # working directory. Need to get the full path.
+            executor_python_path = "{}/{}".format(
+                os.getcwd(), "/".join(self.python_loc.split("/")[:-1]))
+        else:
+            executor_python_path = "/".join(self.python_loc.split("/")[:-1])
+        if "PATH" in os.environ:
+            modified_env["PATH"] = "{}:{}".format(executor_python_path, os.environ["PATH"])
+        else:
+            modified_env["PATH"] = executor_python_path
+        modified_env["LC_ALL"] = "C.UTF-8"
+        modified_env["LANG"] = "C.UTF-8"
         modified_env.pop("MALLOC_ARENA_MAX", None)
         modified_env.pop("RAY_BACKEND_LOG_LEVEL", None)
         # Unset all MKL setting as Analytics Zoo would give default values when init env.
@@ -95,7 +105,7 @@ class RayServiceFuncGenerator(object):
         # This is useful to allocate workers and servers in the cluster.
         # Leave some reserved custom resources free to avoid unknown crash due to resources.
         self.labels = \
-            """--resources='{"_mxnet_worker": %s, "_mxnet_server": %s, "_reserved": %s}' """ \
+            """--resources '{"_mxnet_worker": %s, "_mxnet_server": %s, "_reserved": %s}'""" \
             % (1, 1, 2)
 
     def gen_stop(self):
@@ -177,17 +187,24 @@ class RayServiceFuncGenerator(object):
 
             tc.barrier()
             if tc.partitionId() != 0:
-                print("partition id is : {}".format(tc.partitionId()))
-                process_info = self._start_ray_node(
-                    command=RayServiceFuncGenerator._get_raylet_command(
-                        redis_address=redis_address,
-                        ray_exec=self.ray_exec,
-                        password=self.password,
-                        ray_node_cpu_cores=self.ray_node_cpu_cores,
-                        labels=self.labels,
-                        object_store_memory=self.object_store_memory,
-                        extra_params=self.extra_params),
-                    tag="raylet")
+                import tempfile
+                import filelock
+
+                base_path = tempfile.gettempdir()
+                lock_path = os.path.join(base_path, "ray_on_spark_start.lock")
+                with filelock.FileLock(lock_path):
+                    print("partition id is : {}".format(tc.partitionId()))
+                    process_info = self._start_ray_node(
+                        command=RayServiceFuncGenerator._get_raylet_command(
+                            redis_address=redis_address,
+                            ray_exec=self.ray_exec,
+                            password=self.password,
+                            ray_node_cpu_cores=self.ray_node_cpu_cores,
+                            labels=self.labels,
+                            object_store_memory=self.object_store_memory,
+                            extra_params=self.extra_params),
+                        tag="raylet")
+
             yield process_info
         return _start_ray_services
 
@@ -237,7 +254,7 @@ class RayContext(object):
         """
         assert sc is not None, "sc cannot be None, please create a SparkContext first"
         self.sc = sc
-        self.stopped = False
+        self.initialized = False
         self.is_local = is_local(sc)
         self.verbose = verbose
         self.redis_password = password
@@ -317,9 +334,12 @@ class RayContext(object):
         RayContext._active_ray_context = self
 
     @classmethod
-    def get(cls):
+    def get(cls, initialize=True):
         if RayContext._active_ray_context:
-            return RayContext._active_ray_context
+            ray_ctx = RayContext._active_ray_context
+            if initialize and not ray_ctx.initialized:
+                ray_ctx.init()
+            return ray_ctx
         else:
             raise Exception("No active RayContext. Please create a RayContext and init it first")
 
@@ -337,8 +357,8 @@ class RayContext(object):
         return ips[0]
 
     def stop(self):
-        if self.stopped:
-            print("This instance has been stopped.")
+        if not self.initialized:
+            print("The Ray cluster has not been launched.")
             return
         import ray
         ray.shutdown()
@@ -347,14 +367,14 @@ class RayContext(object):
                 print("Please start the runner first before closing it")
             else:
                 self.ray_processesMonitor.clean_fn()
-        self.stopped = True
+        self.initialized = False
 
     def purge(self):
         """
         Invoke ray stop to clean ray processes.
         """
-        if self.stopped:
-            print("This instance has been stopped.")
+        if not self.initialized:
+            print("The Ray cluster has not been launched.")
             return
         if self.is_local:
             import ray
@@ -364,7 +384,7 @@ class RayContext(object):
                           self.num_ray_nodes,
                           numSlices=self.num_ray_nodes).barrier().mapPartitions(
                 self.ray_service.gen_stop()).collect()
-        self.stopped = True
+        self.initialized = False
 
     def _get_spark_local_cores(self):
         local_symbol = re.match(r"local\[(.*)\]", self.sc.master).group(1)
@@ -384,17 +404,20 @@ class RayContext(object):
         Information contains node_ip_address, redis_address, object_store_address,
         raylet_socket_name, webui_url and session_dir.
         """
-        self.stopped = False
-        if self.is_local:
-            if self.env:
-                os.environ.update(self.env)
-            import ray
-            self._address_info = ray.init(num_cpus=self.ray_node_cpu_cores,
-                                          object_store_memory=self.object_store_memory,
-                                          resources=self.extra_params)
+        if self.initialized:
+            print("The Ray cluster has been launched.")
         else:
-            self._start_cluster()
-            self._address_info = self._start_driver(num_cores=driver_cores)
+            if self.is_local:
+                if self.env:
+                    os.environ.update(self.env)
+                import ray
+                self._address_info = ray.init(num_cpus=self.ray_node_cpu_cores,
+                                              object_store_memory=self.object_store_memory,
+                                              resources=self.extra_params)
+            else:
+                self._start_cluster()
+                self._address_info = self._start_driver(num_cores=driver_cores)
+            self.initialized = True
         return self._address_info
 
     @property
@@ -402,7 +425,7 @@ class RayContext(object):
         if self._address_info:
             return self._address_info
         else:
-            raise Exception("Ray cluster hasn't been initiated yet. Please call init first")
+            raise Exception("The Ray cluster has not been launched yet. Please call init first")
 
     def _start_cluster(self):
         print("Start to launch ray on cluster")
